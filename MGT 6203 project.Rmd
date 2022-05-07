@@ -1,0 +1,499 @@
+Model fitting matches both real and random effects. The real effects are same in all datasets, whereas random effects differ in each dataset. 
+
+When building a model in real life, its very rare that all the predictors in the dataset are useful. 
+
+Adding redundant variables increase the complexity of the model and cause the model to fit too closely to the random effect, leading to a reduction in the generalization capability of the model.
+
+According to the Law of Parsimony, the simplest explanation to an event or observation is preferred. 
+
+Simpler models are often times better than complex ones.
+
+There are many benefits to having a simple model:
+* Less data is required.
+* Less computational resources are needed
+* Easier to interpret
+* Less chance of insignificant or redundant factors in model
+
+Our dataset consists of 124 predictors. This is a large number of features, and our models may suffer from the curse of dimensionality as a result.
+
+The curse of dimensionality refers to when a dataset have too many features. In high dimensional data, all objects appear sparse and dissimilar. 
+This reduce the efficiency of common data organization techniques and make the problem of searching through a space more difficult. 
+
+Domain knowledge and automatic feature selection techniques can be employed to reduce the size of the feature space. 
+
+It allows for simpler models to be created, attenuating the effects of overfitting and curse of dimensionality.
+
+```{r, load_packages}
+library(dplyr)
+library(caret)
+library(Boruta)
+library(car)
+library(glmnet)
+```
+
+```{r, load_data}
+df = readRDS('2000math.rds') %>% 
+     # Filter for country code 124 to select Canadian students only
+     filter(COUNTRY == 124) %>% 
+     # Only selecting variables starting with ST since we are only focusing on the student questionnaire
+     select(starts_with('ST'))
+
+# Display top 6 rows to show that data is loaded in correctly
+head(df)
+```
+
+```{r, check_missing_values}
+# Create function to calculate percent of missing values in a column
+p = function(x) {sum(is.na(x))/length(x)*100}
+
+# Apply previous function to every column to calculate percentage of missing data in each column
+apply(df, 2, p)
+```
+A safe maximum threshold is 5% of the total for large datasets. If missing data for a certain feature or sample is more than 5% then you probably should leave that feature or sample out or gather more measurements. Since gathering more measurements is not possible in this case, we will drop those features.
+
+```{r, get_col_ineligible_imputation}
+# Retrieve columns with more than 5% missing values
+colnames(df)[apply(df, 2, p) == 100]
+```
+
+```{r, additional_etl}
+# Using domain knowledge, I drop columns that I know have no significant effect on the performance in class
+# Also removing columns that with greater than 5% missing value since we cannot use imputation on them
+df = df %>% select(-STIDSTD, #student id
+                   -ST01Q02, # birth month
+                   -ST01Q03, # birth year
+                   -ST02Q01, # grade
+                   -ST09Q01, # text field for mother's job duties (this may be significant, but model cannot handle text field)
+                   -ST11Q01, # text field for mother's job duties (this may be significant, but model cannot handle text field)
+                   -ST40Q01, # text field for student's future dream job (this may be significant, but model cannot handle text field)
+                   -ST41Q01, # reading class grade (not collected for Canadian students, column is all missing values)
+                   -ST41Q02, # math class grade (not collected for Canadian students, column is all missing values)
+                   -ST41Q03, # science class grade (not collected for Canadian students, column is all missing values)
+                   -ST41Q07, #(not collected for Canadian students, column is all missing values)
+                   -ST41Q08, # (not collected for Canadian students, column is all missing values)
+                   -ST41Q09, # (not collected for Canadian students, column is all missing values)
+                   -ST24Q01, # (not collected for Canadian students, column is all missing values)
+                   -ST24Q02, # (not collected for Canadian students, column is all missing values)
+                   -ST25Q01, # (not collected for Canadian students, column is all missing values)
+                   -studrel # not in student questionnaire
+                   )
+
+df = df %>% 
+     # Filter out students who did not provide data in the response variable. This is okay since it's only a small number. 
+     # The dataset still have a large number of examples to train and test on 
+     filter(!is.na(ST41Q05)) %>% 
+     # Using the categorical approach imputation method, missing values can be classified as a new category. 
+     # In this case, missing values are classified as 0. In the original dataset, categorical values start from 1.            
+     mutate_all(~replace(., is.na(.), 0)) %>% 
+     # Dataset consists of categorical variables. Converting those columns to factors are necessary for modeling
+     mutate_all(~as.factor(.)) %>% 
+     # re-categorize response variable into binomial class. We are interested in failing vs non-failing students.
+     mutate(ST41Q05 = as.factor(ifelse(ST41Q05 == 3, 1, 0)))
+```
+
+```{r, class_distribution}
+# Check number of students in each class (fail vs pass)
+# 1 means the student failed their class, and 0 means passing. 
+df %>% group_by(ST41Q05) %>% summarize(n = n())
+```
+
+```{r, data_split}
+# set seed for reproducibility
+set.seed(6203)
+
+# randomly select 70% of the data and get their index
+trn_idx = sample(nrow(df), size = .7 * nrow(df))
+
+# select rows that match the index as training dataset
+df_trn = df[trn_idx, ]
+
+# select rest of the rows as testing dataset
+df_tst = df[-trn_idx, ]
+
+# convert response variable to levels for classification models
+levels(df_trn$ST41Q05) = c('No', 'Yes')
+levels(df_tst$ST41Q05) = c('No', 'Yes')
+```
+
+
+
+```{r, training_class_imbalance}
+# check distribution of class in the training dataset
+df_trn %>% group_by(ST41Q05) %>% summarize(n = n())
+```
+The training dataset has imbalanced classes. Majority of the observations are non-positive cases (passing students). This may affect the models since there may not be enough positive cases to learn from.
+
+```{r, testing_class_imbalance}
+# check distribution of class in the test dataset
+df_tst %>% group_by(ST41Q05) %>% summarize(n = n())
+```
+The testing dataset also has an imbalanced class distribution. However, this is okay. The test set is used to evaluate the quality of the model. The imbalanced class distribution is representative of the distribution in real life. In real life, failing students also resemble a minority as most students pass their classes.
+
+We may want to balance the class distribution in the training dataset. SMOTE can be used to achieve this.
+SMOTE is an oversampling technique where the synthetic samples are generated for the minority class. 
+This algorithm helps to overcome the overfitting problem posed by random oversampling.
+
+However, feature selection should be done before smote since 
+oversampling the minority class with SMOTE violates the independence assumption.
+
+```{r, boruta_feature_selection, cache = TRUE}
+set.seed(6203)
+# boruta on training data with max run of 11 due to time constraints
+boruta = TentativeRoughFix(Boruta(ST41Q05 ~ ., data = df_trn, maxRuns = 11))
+boruta
+```
+
+```{r}
+# Get important features from Boruta algorithm 
+getNonRejectedFormula(boruta)
+```
+
+Boruta is a feature ranking and selection algorithm based on random forests algorithm. The advantage with Boruta is that it clearly decides if a variable is important or not and helps to select variables that are statistically significant. 
+
+```{r, logistic_regression_boruta_smote}
+# Set seed for reproducibility
+set.seed(6203)
+
+# train logistic regression model using features selected by the Boruta algorithm
+glm_mod = train(ST41Q05 ~ ST03Q01 + ST04Q04 + ST05Q02 + ST06Q01 + ST07Q01 + ST13Q01 + 
+                ST14Q01 + ST16Q01 + ST16Q03 + ST18Q01 + ST18Q02 + ST18Q03 + 
+                ST18Q04 + ST18Q05 + ST18Q06 + ST19Q04 + ST19Q06 + ST20Q03 + 
+                ST20Q04 + ST20Q05 + ST21Q03 + ST21Q06 + ST21Q08 + ST21Q10 + 
+                ST22Q04 + ST23Q01 + ST24Q06 + ST26Q04 + ST26Q05 + ST26Q06 + 
+                ST26Q07 + ST26Q08 + ST26Q09 + ST26Q12 + ST26Q14 + ST26Q15 + 
+                ST26Q17 + ST27Q05 + ST27Q06 + ST28Q01 + ST35Q01 + ST35Q02 + 
+                ST36Q03 + ST36Q05 + ST39Q03 + ST39Q04 + ST39Q05 + ST41Q04 + 
+                ST41Q06,
+                data = df_trn, 
+                method = 'glm',
+                family = 'binomial',
+                # 5-fold cross validation /w SMOTE to address class imbalance
+                trControl = trainControl(method = 'cv', 
+                                         number = 5, 
+                                         classProbs = TRUE, 
+                                         summaryFunction = twoClassSummary, 
+                                         verboseIter = FALSE,
+                                         sampling = 'smote'
+                                         ),
+                metric = 'ROC'
+                )
+
+summary(glm_mod)
+```
+
+```{r, logistic_regression_boruta_smote_significant_variables}
+# count number of significant variables
+sum(summary(glm_mod)$coefficients[ ,4] < 0.05)
+
+# display significant variables and their coefficients
+summary(glm_mod)$coefficients[ ,4][summary(glm_mod)$coefficients[ ,4] < 0.05]
+
+# count significant variables by question #
+table(substr(rownames(summary(glm_mod)$coefficients)[summary(glm_mod)$coefficients[ ,4] < 0.05], 1, 4))
+```
+
+```{r, logistic_regression_boruta_smote_cm}
+# use model to predict on test set
+glm_pred = predict(glm_mod, df_tst, type = 'raw')
+
+# generate confusion matrix
+confusionMatrix(glm_pred, reference = df_tst$ST41Q05, positive = 'Yes')
+```
+
+```{r, logistic_regression_boruta}
+# Set seed for reproducibility
+set.seed(6203)
+
+# train logistic regression model using features selected by the Boruta algorithm
+glm_mod2 = train(ST41Q05 ~ ST03Q01 + ST04Q04 + ST05Q02 + ST06Q01 + ST07Q01 + ST13Q01 + 
+                           ST14Q01 + ST16Q01 + ST16Q03 + ST18Q01 + ST18Q02 + ST18Q03 + 
+                           ST18Q04 + ST18Q05 + ST18Q06 + ST19Q04 + ST19Q06 + ST20Q03 + 
+                           ST20Q04 + ST20Q05 + ST21Q03 + ST21Q06 + ST21Q08 + ST21Q10 + 
+                           ST22Q04 + ST23Q01 + ST24Q06 + ST26Q04 + ST26Q05 + ST26Q06 + 
+                           ST26Q07 + ST26Q08 + ST26Q09 + ST26Q12 + ST26Q14 + ST26Q15 + 
+                           ST26Q17 + ST27Q05 + ST27Q06 + ST28Q01 + ST35Q01 + ST35Q02 + 
+                           ST36Q03 + ST36Q05 + ST39Q03 + ST39Q04 + ST39Q05 + ST41Q04 + 
+                           ST41Q06,
+                data = df_trn, 
+                method = 'glm', 
+                family = 'binomial',
+                # 5-fold cross validation
+                trControl = trainControl(method = 'cv', 
+                                         number = 5, 
+                                         classProbs = TRUE, 
+                                         summaryFunction = twoClassSummary, 
+                                         verboseIter = FALSE,
+                                         ),
+                metric = 'ROC'
+                )
+
+summary(glm_mod2)
+```
+
+```{r, logistic_regression_boruta_cm}
+# use model to predict on test set
+glm_pred2 = predict(glm_mod2, df_tst, type = 'raw')
+# generate confusion matrix
+confusionMatrix(glm_pred2, reference = df_tst$ST41Q05, positive = 'Yes')
+
+
+
+```
+
+```{r, logistic_regression_boruta_significant_features}
+table(substr(rownames(summary(glm_mod2)$coefficients)[summary(glm_mod2)$coefficients[ ,4] < 0.05], 1, 4))
+sum(summary(glm_mod2)$coefficients[ ,4] < 0.05 )
+```
+
+```{r, random_forest_smote}
+# set seed for reproducibility
+set.seed(6203)
+
+# train random forest model 
+rf_mod = train(ST41Q05 ~ .,
+               data = df_trn, 
+               # ranger is a faster implementation of random forest, useful for high dimensional data
+               method = 'ranger', 
+               # 5 fold cross validation with SMOTE to address class imbalance
+               trControl = trainControl(method = 'cv', 
+                                        number = 5, 
+                                        classProbs = TRUE, 
+                                        summaryFunction = twoClassSummary, 
+                                        verboseIter = FALSE,
+                                        search = 'grid',
+                                        sampling = 'smote'
+                                       ),
+               metric = 'ROC',
+               tuneGrid = expand.grid(mtry = 1:30,
+                                      splitrule = 'gini',
+                                      min.node.size = c(10, 20)
+                                     ),
+               num.trees = 10,
+               importance = 'impurity'
+               )
+
+varImp(rf_mod)
+```
+
+```{r, random_forest_smote_cm}
+# use model to predict on test data
+rf_pred = predict(rf_mod, df_tst, type = 'raw')
+
+# setup confusion matrix 
+confusionMatrix(rf_pred, reference = df_tst$ST41Q05, positive = 'Yes')
+```
+```{r, random_forest}
+# set seed for reproducibility
+set.seed(6203)
+
+# train random forest model 
+rf_mod2 = train(ST41Q05 ~ .,
+                data = df_trn, 
+                # ranger is a faster implementation of random forest, useful for high dimensional data
+                method = 'ranger', 
+                # 5 fold cross validation 
+                trControl = trainControl(method = 'cv', 
+                                         number = 5, 
+                                         classProbs = TRUE, 
+                                         summaryFunction = twoClassSummary, 
+                                         verboseIter = FALSE,
+                                         search = 'grid'
+                                        ),
+                metric = 'ROC',
+                tuneGrid = expand.grid(mtry = 1:30,
+                                       splitrule = 'gini',
+                                       min.node.size = c(10, 20)
+                                      ),
+                num.trees = 10,
+                importance = 'impurity'
+                )
+
+varImp(rf_mod2)
+```
+
+```{r, random_forest_cm}
+# use model to predict on test data
+rf_pred2 = predict(rf_mod2, df_tst, type = 'raw')
+
+# setup confusion matrix 
+confusionMatrix(rf_pred2, reference = df_tst$ST41Q05, positive = 'Yes')
+```
+
+```{r, lasso_logistic_smote}
+# set seed for reproducibility 
+set.seed(6203)
+
+# setup lambda values for tuning
+lambda = 10^seq(-3, 3, length = 100)
+
+# train lasso logistic model: it uses lasso for feature selection then applies it to logistic regression
+lasso_mod = train(ST41Q05 ~ ., 
+                  data  = df_trn,
+                  method = 'glmnet',
+                  # set family as binomial for logistic model
+                  family='binomial',
+                  # 5-fold cross validation with smote to deal with class imbalance
+                  trControl = trainControl(method = 'cv', 
+                                           number = 5, 
+                                           classProbs = TRUE, 
+                                           summaryFunction = twoClassSummary, 
+                                           verboseIter = FALSE,
+                                           search = 'grid',
+                                           sampling = 'smote'
+                                          ),
+                  # hyperparameter tuning lambda
+                  tuneGrid = expand.grid(alpha = 1, lambda = lambda),
+                  metric = 'ROC',
+                  trace = FALSE)
+
+summary(lasso_mod)
+```
+
+The lasso model has built in feature selecion. The lasso picks out non-important variables and set their coefficients to zero. This may cause sharp decreases to zero where as the variables in the ridge model slowly converges to zero. As the penalty increases, more non-important variables are selected.
+
+Lasso adds constraint to the standard regression equation and shrinks the coefficient estimates towards zero when lambda is large enough. By shrinking the coefficient, prediction accuarcy can improve and variance can decrease.
+
+Lasso regression can be used on data with many predictors for variable selection.
+
+Thus, it can be used to find a sparse model with a small subset of predictors.
+
+```{r, lasso_logistic_smote_coef}
+# get coefficients from model
+coef = coef(lasso_mod$finalModel, lasso_mod$finalModel$lambdaOpt)
+
+# display important features from model
+coef[coef[,1] > 0, ,drop = F]
+```
+The lasso model has built-in feature selection. The coefficient of non-important variables are set to zero. 
+
+```{r, lasso_logistic_smote_cm}
+# Use model to predict on test set
+lasso_pred = predict(lasso_mod, df_tst, type = 'raw')
+
+# setup confusion matrix
+confusionMatrix(lasso_pred, reference = df_tst$ST41Q05, positive = 'Yes')
+```
+
+```{r, lasso_logistic}
+# set seed for reproducibility 
+set.seed(6203)
+
+# train lasso logistic model: it uses lasso for feature selection then applies it to logistic regression
+lasso_mod2 = train(ST41Q05 ~ ., 
+                  data  = df_trn,
+                  method = 'glmnet',
+                  # set family as binomial for logistic model
+                  family = 'binomial',
+                  # 5-fold cross validation
+                  trControl = trainControl(method = 'cv', 
+                                           number = 5, 
+                                           classProbs = TRUE, 
+                                           summaryFunction = twoClassSummary, 
+                                           verboseIter = FALSE,
+                                           search = 'grid'
+                                          ),
+                  tuneGrid = expand.grid(alpha = 1, lambda = lambda),
+                  metric = 'ROC',
+                  trace = FALSE)
+
+summary(lasso_mod2)
+```
+
+```{r, lasso_logistic_cm}
+# Use model to predict on test set
+lasso_pred2 = predict(lasso_mod2, df_tst, type = 'raw')
+
+# setup confusion matrix
+confusionMatrix(lasso_pred2, reference = df_tst$ST41Q05, positive = 'Yes')
+```
+
+```{r, lasso_logistic_coef
+
+.000000000000000000000000000000000000000000000000000000000000000000000000000000000
+.0.0}
+# get coefficients from model
+coef2 = coef(lasso_mod2$finalModel, lasso_mod2$finalModel$lambdaOpt)
+
+# display important features from model
+coef2[coef2[,1] > 0, ,drop = F]
+```
+```{r, elastic_logitistic_smote}
+# set seed for reproducibility 
+set.seed(6203)
+
+# train logistic model /w elastic net classifier: it uses elastic net for feature selection then applies it to logistic regression
+elastic_mod = train(ST41Q05 ~ ., 
+                    data  = df_trn,
+                    method = 'glmnet',
+                    # set family as binomial for logistic model
+                    family = 'binomial',
+                    # 5-fold cross validation /w SMOTE to address class imbalance
+                    trControl = trainControl(method = 'cv', 
+                                             number = 5, 
+                                             classProbs = TRUE, 
+                                             summaryFunction = twoClassSummary, 
+                                             verboseIter = FALSE,
+                                             sampling = 'smote'
+                                            ),
+                    metric = 'ROC',
+                    tuneLength = 10,
+                    trace = FALSE)
+
+elastic_mod
+```
+
+```{r, elastic_logistic_smote_coef}
+# get coefficients from model
+coef = coef(elastic_mod$finalModel, elastic_mod$bestTune$lambda)
+
+# display important features from model
+coef[coef[,1] > 0, ,drop = F]
+```
+
+```{r, elastic_logistic_smote_cm}
+# use model to predict on test set
+elastic_pred = predict(elastic_mod, df_tst, type = 'raw')
+
+# setup confusion matrix
+confusionMatrix(elastic_pred, reference = df_tst$ST41Q05, positive = 'Yes')
+```
+
+```{r, elastic_logistic}
+# set seed for reproducibility 
+set.seed(6203)
+
+# train logistic model /w elastic net classifier: it uses elastic net for feature selection then applies it to logistic regression
+elastic_mod2 = train(ST41Q05 ~ ., 
+                    data  = df_trn,
+                    method = 'glmnet',
+                    # set family as binomial for logistic model
+                    family = 'binomial',
+                    # 5-fold cross validation
+                    trControl = trainControl(method = 'cv', 
+                                             number = 5, 
+                                             classProbs = TRUE, 
+                                             summaryFunction = twoClassSummary, 
+                                             verboseIter = FALSE
+                                            ),
+                    metric = 'ROC',
+                    tuneLength = 10,
+                    trace = FALSE)
+
+elastic_mod2
+```
+
+```{r, elastic_logistic_coef}
+# get coefficients from model
+coef = coef(elastic_mod2$finalModel, elastic_mod2$bestTune$lambda)
+
+# display important features from model
+coef[coef[,1] > 0, ,drop = F]
+```
+
+```{r, elastic_logistic_cm}
+# use model to predict on test set
+elastic_pred2 = predict(elastic_mod2, df_tst, type = 'raw')
+
+# setup confusion matrix
+confusionMatrix(elastic_pred2, reference = df_tst$ST41Q05, positive = 'Yes')
+```
